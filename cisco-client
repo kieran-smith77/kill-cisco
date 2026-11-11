@@ -1,0 +1,285 @@
+#!/bin/bash
+# Cisco Secure Client 5.1 / macOS 13+ service toggle.
+# Uses Cisco's documented service-registration lifecycle, not the product uninstaller.
+
+SERVICE_APP='/opt/cisco/secureclient/bin/Cisco Secure Client - AnyConnect VPN Service.app'
+CLIENT_APP='/Applications/Cisco/Cisco Secure Client.app'
+SERVICE_EXEC="$SERVICE_APP/Contents/MacOS/Cisco Secure Client - AnyConnect VPN Service"
+SERVICE_TARGET='system/com.cisco.secureclient.vpn.service.agent'
+WAIT_SECONDS=30
+
+say() { printf '%s\n' "$*"; }
+error() { printf 'cisco-client: %s\n' "$*" >&2; }
+lc() { /bin/launchctl "$@"; }
+process_names() { /bin/ps -axo comm=; }
+wait_tick() { /bin/sleep 1; }
+
+preflight() {
+    [[ $(/usr/bin/uname -s) == Darwin ]] || { error 'macOS is required.'; return 1; }
+    [[ -x "$SERVICE_EXEC" ]] || {
+        error "Expected Secure Client 5.1 service not found: $SERVICE_EXEC"
+        return 1
+    }
+}
+
+# A missing service is different from an inaccessible launchd domain or failed ps.
+read_state() {
+    local detail names name
+    REGISTERED=0
+    VPN=0
+    UMBRELLA=0
+    SWG=0
+    DNSCRYPT=0
+    lc print system >/dev/null 2>&1 || {
+        error 'Cannot inspect system launchd. Run from a local Terminal with permission to inspect system services.'
+        return 1
+    }
+    if detail=$(lc print "$SERVICE_TARGET" 2>&1); then
+        REGISTERED=1
+    elif [[ "$detail" != *'Could not find service'* ]]; then
+        error "Cannot inspect Cisco service: $detail"
+        return 1
+    fi
+    names=$(process_names) || { error 'Cannot inspect running processes.'; return 1; }
+    while IFS= read -r name; do
+        case "$name" in
+            vpnagentd|*/vpnagentd) VPN=1 ;;
+            acumbrellaagent|*/acumbrellaagent) UMBRELLA=1 ;;
+            csc_swgagent|*/csc_swgagent) SWG=1 ;;
+            /opt/cisco/secureclient/bin/dnscryptproxy) DNSCRYPT=1 ;;
+        esac
+    done <<< "$names"
+}
+
+is_off() { [[ $REGISTERED == 0 && $VPN == 0 && $UMBRELLA == 0 && $SWG == 0 && $DNSCRYPT == 0 ]]; }
+is_on() { [[ $REGISTERED == 1 && $VPN == 1 ]]; }
+
+as_console_user() {
+    local console_uid console_user
+    console_uid=$(/usr/bin/stat -f '%u' /dev/console) || return 1
+    [[ "$console_uid" =~ ^[0-9]+$ && "$console_uid" -gt 0 ]] || {
+        error 'A logged-in desktop user is required.'
+        return 1
+    }
+    if [[ $EUID == "$console_uid" ]]; then
+        "$@"
+    elif [[ $EUID == 0 ]]; then
+        console_user=$(/usr/bin/id -un "$console_uid") || return 1
+        lc asuser "$console_uid" /usr/bin/sudo -u "$console_user" -- "$@"
+    else
+        error 'Run as the logged-in desktop user, or as root.'
+        return 1
+    fi
+}
+
+admin_auth() {
+    if [[ $EUID != 0 ]]; then /usr/bin/sudo -v; fi
+}
+
+unregister_service() {
+    if [[ $EUID == 0 ]]; then
+        "$SERVICE_EXEC" uninstall
+    else
+        /usr/bin/sudo -- "$SERVICE_EXEC" uninstall
+    fi
+}
+
+quit_service_app() {
+    as_console_user /usr/bin/osascript -e \
+        'if application "Cisco Secure Client - AnyConnect VPN Service" is running then tell application "Cisco Secure Client - AnyConnect VPN Service" to quit'
+}
+
+open_service_app() { as_console_user /usr/bin/open -a "$SERVICE_APP"; }
+open_client_app() { as_console_user /usr/bin/open -a "$CLIENT_APP"; }
+
+wait_for_state() {
+    local wanted=$1 elapsed=0
+    while (( elapsed <= WAIT_SECONDS )); do
+        read_state || return 1
+        if [[ "$wanted" == off ]]; then
+            is_off && return 0
+        else
+            is_on && return 0
+        fi
+        (( elapsed == WAIT_SECONDS )) && break
+        wait_tick
+        elapsed=$((elapsed + 1))
+    done
+    error "Timed out waiting for Cisco service state: $wanted."
+    return 1
+}
+
+show_status() {
+    read_state || return 1
+    if is_off; then
+        say 'Core/Umbrella service: OFF'
+    elif is_on; then
+        say 'Core/Umbrella service: ON'
+    else
+        say 'Core/Umbrella service: PARTIAL (use cisco-on to recover)'
+    fi
+    printf 'Registered=%s  VPN=%s  Umbrella=%s  SWG=%s  DNS proxy=%s\n' \
+        "$REGISTERED" "$VPN" "$UMBRELLA" "$SWG" "$DNSCRYPT"
+    say 'ON verifies the core service only; Umbrella/SWG can take longer to connect.'
+    say 'Cisco socket filter and Zero Trust Access are separate; use cisco-check to inspect S3 TLS.'
+}
+
+turn_on() {
+    read_state || return 1
+    if is_on; then
+        say 'Cisco core service is already running.'
+    else
+        say 'Starting Cisco Secure Client service...'
+        open_service_app || {
+            error 'Could not open the Cisco service app. Check Background Items approval in System Settings.'
+            return 1
+        }
+        wait_for_state on || return 1
+    fi
+    say 'Opening Cisco Secure Client...'
+    open_client_app || {
+        error 'Cisco core service is running, but the Cisco Secure Client app could not be opened.'
+        return 1
+    }
+    say 'Cisco core service is running and the client app opened. Allow Umbrella/SWG to reconnect.'
+}
+
+recover_after_stop_failure() {
+    error 'Stop failed; attempting to restore the Cisco service.'
+    turn_on || error 'RESTORE FAILED. Run cisco-on or open the Cisco service app manually.'
+    return 1
+}
+
+turn_off() {
+    read_state || return 1
+    if is_off; then say 'Cisco Core/Umbrella service is already stopped.'; return 0; fi
+    # Acquire privileges before quitting anything, so a cancelled prompt is harmless.
+    admin_auth || return 1
+    say 'Stopping Cisco Core/Umbrella (active VPN connections will disconnect)...'
+    quit_service_app || { recover_after_stop_failure; return 1; }
+    unregister_service || { recover_after_stop_failure; return 1; }
+    wait_for_state off || { recover_after_stop_failure; return 1; }
+    say 'Cisco Core/Umbrella service paused. Run cisco-check, then cisco-on when finished.'
+}
+
+run_temporarily() {
+    # This script is a separate process: traps/proxy changes cannot affect its caller.
+    [[ $# -gt 0 ]] || { error 'Usage: cisco-client run COMMAND [ARG ...]'; exit 2; }
+    local restore_needed=0
+    cleanup() {
+        local result=$?
+        trap - EXIT
+        # A signal to the foreground process group can still be propagating.
+        # Keep restoration and its child commands from being interrupted again.
+        trap '' HUP INT TERM
+        if [[ $restore_needed == 1 ]]; then
+            if ! turn_on; then
+                error 'RESTORE FAILED. Run cisco-on immediately.'
+                [[ $result != 0 ]] || result=1
+            fi
+        fi
+        exit "$result"
+    }
+    read_state || exit 1
+    if ! is_off; then
+        is_on || { error 'Cisco is in a partial state. Run cisco-on before using run.'; exit 1; }
+        restore_needed=1
+        trap cleanup EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        turn_off || exit 1
+    fi
+    # Scope removal of explicit HTTP proxies to this command only.
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+    "$@"
+    # Exit while restore_needed is still in scope for the EXIT trap.
+    exit $?
+}
+
+curl_s3() {
+    /usr/bin/curl --noproxy '*' --head --silent --show-error --verbose \
+        --connect-timeout 5 --max-time 12 --output /dev/null \
+        'https://s3.eu-west-1.amazonaws.com/' 2>&1
+}
+
+check_tls() {
+    local detail result issuer line
+    # Public request only: no AWS credentials, no resource creation, bounded time.
+    detail=$(curl_s3)
+    result=$?
+    issuer=''
+    while IFS= read -r line; do
+        case "$line" in
+            *'subject:'*|*'issuer:'*) say "$line" ;;
+        esac
+        case "$line" in *'issuer:'*) issuer=$line ;; esac
+    done <<< "$detail"
+    if [[ $result != 0 ]]; then
+        error "S3 TLS check failed (curl $result)."
+        # Avoid dumping proxy URLs or unrelated environment details.
+        return 1
+    fi
+    [[ -n "$issuer" ]] || { error 'curl did not expose the TLS issuer; result is inconclusive.'; return 1; }
+    case "$issuer" in
+        *[Cc][Ii][Ss][Cc][Oo]*|*[Uu][Mm][Bb][Rr][Ee][Ll][Ll][Aa]*)
+            error 'Cisco TLS interception is still present for S3.'
+            return 2 ;;
+        *) say 'No Cisco issuer observed for this S3 endpoint. This does not verify other traffic.' ;;
+    esac
+}
+
+dry_run() {
+    case "${1-}" in
+        off)
+            say 'Would quit the Cisco VPN Service helper as the desktop user, then run:'
+            printf 'sudo %q uninstall\n' "$SERVICE_EXEC" ;;
+        on)
+            say 'Would run as the desktop user:'
+            printf 'open -a %q\n' "$SERVICE_APP"
+            printf 'open -a %q\n' "$CLIENT_APP" ;;
+        *) error 'Usage: cisco-client --dry-run off|on'; return 2 ;;
+    esac
+}
+
+usage() {
+    cat <<'HELP'
+Usage: cisco-client off|on|toggle|status|check
+       cisco-client run COMMAND [ARG ...]
+       cisco-client --dry-run off|on
+
+off      Pause Core VPN, Umbrella DNS and the SWG child service; requires sudo.
+on       Restore the Cisco service and open the Cisco Secure Client app.
+toggle   Switch the Core/Umbrella service state.
+status   Inspect registration and Cisco child processes; makes no changes.
+check    Inspect the TLS issuer on the public eu-west-1 S3 endpoint.
+run      Pause for one command and restore on exit, error, Ctrl-C, HUP or TERM.
+
+off stays in effect until on (and may survive reboot). Network extensions and
+Zero Trust Access remain separately managed. Stop/start does not prove a bypass.
+run cannot restore after SIGKILL, a script process crash or power loss.
+HELP
+}
+
+main() {
+    case "${1-}" in help|--help|-h|'') usage; return 0 ;; esac
+    preflight || return 1
+    case "$1" in
+        off|on|toggle|status|check) [[ $# == 1 ]] || { usage >&2; return 2; } ;;
+        run) shift; run_temporarily "$@"; return $? ;;
+        --dry-run) shift; [[ $# == 1 ]] || return 2; dry_run "$@"; return $? ;;
+        *) usage >&2; return 2 ;;
+    esac
+    case "$1" in
+        off) turn_off ;;
+        on) turn_on ;;
+        status) show_status ;;
+        check) check_tls ;;
+        toggle)
+            read_state || return 1
+            if is_off; then turn_on; elif is_on; then turn_off
+            else error 'Partial state; run cisco-on to recover.'; return 1; fi ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

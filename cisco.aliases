@@ -1,0 +1,20 @@
+# Source from Bash or Zsh. Resolves this directory even when it contains spaces.
+if [ -n "${ZSH_VERSION-}" ]; then
+    _cisco_source="${(%):-%x}"
+elif [ -n "${BASH_VERSION-}" ]; then
+    _cisco_source="${BASH_SOURCE[0]}"
+else
+    printf '%s\n' 'Cisco functions require Bash or Zsh.' >&2
+    return 1
+fi
+CISCO_TOGGLE_SCRIPT="$(cd -- "$(dirname -- "$_cisco_source")" && pwd -P)/cisco-client"
+unset _cisco_source
+
+cisco-off()     { /bin/bash "$CISCO_TOGGLE_SCRIPT" off "$@"; }
+cisco-on()      { /bin/bash "$CISCO_TOGGLE_SCRIPT" on "$@"; }
+cisco-toggle()  { /bin/bash "$CISCO_TOGGLE_SCRIPT" toggle "$@"; }
+cisco-status()  { /bin/bash "$CISCO_TOGGLE_SCRIPT" status "$@"; }
+cisco-check()   { /bin/bash "$CISCO_TOGGLE_SCRIPT" check "$@"; }
+without-cisco(){ /bin/bash "$CISCO_TOGGLE_SCRIPT" run "$@"; }
+kill-cisco()    { cisco-off "$@"; }
+start-cisco()   { cisco-on "$@"; }
