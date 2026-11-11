@@ -72,13 +72,11 @@ Stopping a service is **not proof that traffic bypasses inspection**. A socket f
 
 If interception remains, run `cisco-on` and use a destination or decryption exception in your organization's policy. See [troubleshooting and recovery](docs/troubleshooting.md).
 
-## Requirements and verification
+## Requirements
 
 - macOS with `/bin/bash` and the Secure Client 5.1 helper at its standard path.
 - An administrator account for stopping the service and a logged-in desktop session for opening the apps.
-- Bash or Zsh for the shell functions. Python 3.8+ is needed only to run the tests.
-
-Automated tests simulate service commands, process state and installation into temporary startup files. GitHub Actions is configured for macOS 15 and 26. These tests do not install Cisco, prove an enrolled client's reconnect behavior or certify bypass of inspection. End-to-end stop/start and signed AWS operations remain unverified. See [development and validation](docs/development.md).
+- Bash or Zsh for the shell functions.
 
 ## Uninstall
 
